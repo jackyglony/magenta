@@ -16,7 +16,7 @@
 #include "trace.h"
 #include "virtio_priv.h"
 
-#define LOCAL_TRACE 0
+#define LOCAL_TRACE 1
 
 namespace virtio {
 
@@ -78,6 +78,10 @@ mx_status_t Device::Bind(pci_protocol_t* pci,
 
     LTRACEF("irq handle %u\n", irq_handle_.get());
 
+    TRACEF("pci config status 0x%x\n", pci_config_->status);
+    TRACEF("pci config capabilities_ptr 0x%x\n", pci_config_->capabilities_ptr);
+    //hexdump8(pci_config_, 4096);
+
     if (trans_) {
         LTRACEF("transitional\n");
         // transitional devices have a single PIO window at BAR0
@@ -114,12 +118,12 @@ mx_status_t Device::Bind(pci_protocol_t* pci,
                 VIRTIO_ERROR("failed to access PIO range %#x, length %#xw\n", bar0_pio_base_, bar0_size_);
                 return r;
             }
+        }
 
-            // enable pio access
-            if ((r = pci->enable_pio(bus_device_, true)) < 0) {
-                VIRTIO_ERROR("cannot enable PIO %d\n", r);
-                return -1;
-            }
+        // enable pio access
+        if ((r = pci->enable_pio(bus_device_, true)) < 0) {
+            VIRTIO_ERROR("cannot enable PIO %d\n", r);
+            return -1;
         }
     } else {
         // non transitional
@@ -220,7 +224,22 @@ void Device::StartIrqThread() {
     thrd_detach(irq_thread_);
 }
 
-uint8_t Device::ReadConfigBar(uint16_t offset) {
+namespace {
+template <typename T> T ioread(uint16_t port);
+
+template<> uint8_t ioread<uint8_t>(uint16_t port) { return inp(port); }
+template<> uint16_t ioread<uint16_t>(uint16_t port) { return inpw(port); }
+template<> uint32_t ioread<uint32_t>(uint16_t port) { return inpd(port); }
+
+template <typename T> void iowrite(uint16_t port, T val);
+
+template<> void iowrite<uint8_t>(uint16_t port, uint8_t val) { return outp(port, val); }
+template<> void iowrite<uint16_t>(uint16_t port, uint16_t val) { return outpw(port, val); }
+template<> void iowrite<uint32_t>(uint16_t port, uint32_t val) { return outpd(port, val); }
+} // anon namespace
+
+template <typename T>
+T Device::ReadConfigBar(uint16_t offset) {
     if (!trans_) {
         assert(0);
         return 0;
@@ -229,7 +248,11 @@ uint8_t Device::ReadConfigBar(uint16_t offset) {
     if (bar0_pio_base_) {
         uint16_t port = (bar0_pio_base_ + offset) & 0xffff;
         LTRACEF_LEVEL(3, "port %#x\n", port);
-        return inp(port);
+        return ioread<T>(port);
+    } else if (bar0_mmio_base_) {
+        volatile T *addr = (volatile T *)(bar0_mmio_base_ + offset);
+        LTRACEF_LEVEL(3, "addr %p\n", addr);
+        return *addr;
     } else {
         // XXX implement
         assert(0);
@@ -237,7 +260,8 @@ uint8_t Device::ReadConfigBar(uint16_t offset) {
     }
 }
 
-void Device::WriteConfigBar(uint16_t offset, uint8_t val) {
+template <typename T>
+void Device::WriteConfigBar(uint16_t offset, T val) {
     if (!trans_) {
         assert(0);
         return;
@@ -246,7 +270,11 @@ void Device::WriteConfigBar(uint16_t offset, uint8_t val) {
     if (bar0_pio_base_) {
         uint16_t port = (bar0_pio_base_ + offset) & 0xffff;
         LTRACEF_LEVEL(3, "port %#x\n", port);
-        outp(port, val);
+        iowrite<T>(port, val);
+    } else if (bar0_mmio_base_) {
+        volatile T *addr = (volatile T *)(bar0_mmio_base_ + offset);
+        LTRACEF_LEVEL(3, "addr %p\n", addr);
+        *addr = val;
     } else {
         // XXX implement
         assert(0);
@@ -262,14 +290,10 @@ mx_status_t Device::CopyDeviceConfig(void* _buf, size_t len) {
     // XXX handle MSI vs noMSI
     size_t offset = VIRTIO_PCI_CONFIG_OFFSET_NOMSI;
 
+    //hexdump8((const void *)bar0_mmio_base_, 0x40);
     uint8_t* buf = (uint8_t*)_buf;
     for (size_t i = 0; i < len; i++) {
-        if (bar0_pio_base_) {
-            buf[i] = ReadConfigBar((offset + i) & 0xffff);
-        } else {
-            // XXX implement
-            assert(0);
-        }
+        buf[i] = ReadConfigBar<uint8_t>((offset + i) & 0xffff);
     }
 
     return NO_ERROR;
@@ -284,6 +308,13 @@ void Device::SetRing(uint16_t index, uint16_t count, mx_paddr_t pa_desc, mx_padd
             outpw((bar0_pio_base_ + VIRTIO_PCI_QUEUE_SELECT) & 0xffff, index);
             outpw((bar0_pio_base_ + VIRTIO_PCI_QUEUE_SIZE) & 0xffff, count);
             outpd((bar0_pio_base_ + VIRTIO_PCI_QUEUE_PFN) & 0xffff, (uint32_t)(pa_desc / PAGE_SIZE));
+        } else if (bar0_mmio_base_) {
+            volatile uint16_t *ptr16 = (volatile uint16_t *)(bar0_mmio_base_ + VIRTIO_PCI_QUEUE_SELECT);
+            *ptr16 = index;
+            ptr16 = (volatile uint16_t *)(bar0_mmio_base_ + VIRTIO_PCI_QUEUE_SIZE);
+            *ptr16 = count;
+            volatile uint32_t *ptr32 = (volatile uint32_t *)(bar0_mmio_base_ + VIRTIO_PCI_QUEUE_PFN);
+            *ptr32 = (uint32_t)(pa_desc / PAGE_SIZE);
         } else {
             // XXX implement
             assert(0);
@@ -316,7 +347,7 @@ void Device::RingKick(uint16_t ring_index) {
 
 void Device::Reset() {
     if (trans_) {
-        WriteConfigBar(VIRTIO_PCI_DEVICE_STATUS, 0);
+        WriteConfigBar<uint8_t>(VIRTIO_PCI_DEVICE_STATUS, 0);
     } else {
         mmio_regs_.common_config->device_status = 0;
     }
@@ -324,7 +355,7 @@ void Device::Reset() {
 
 void Device::StatusAcknowledgeDriver() {
     if (trans_) {
-        uint8_t val = ReadConfigBar(VIRTIO_PCI_DEVICE_STATUS);
+        uint8_t val = ReadConfigBar<uint8_t>(VIRTIO_PCI_DEVICE_STATUS);
         val |= VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER;
         WriteConfigBar(VIRTIO_PCI_DEVICE_STATUS, val);
     } else {
@@ -334,7 +365,7 @@ void Device::StatusAcknowledgeDriver() {
 
 void Device::StatusDriverOK() {
     if (trans_) {
-        uint8_t val = ReadConfigBar(VIRTIO_PCI_DEVICE_STATUS);
+        uint8_t val = ReadConfigBar<uint8_t>(VIRTIO_PCI_DEVICE_STATUS);
         val |= VIRTIO_STATUS_DRIVER_OK;
         WriteConfigBar(VIRTIO_PCI_DEVICE_STATUS, val);
     } else {

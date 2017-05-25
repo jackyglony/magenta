@@ -40,8 +40,8 @@ public:
 
 protected:
     // read bytes out of BAR 0's config space
-    uint8_t ReadConfigBar(uint16_t offset);
-    void WriteConfigBar(uint16_t offset, uint8_t val);
+    template <typename T> T ReadConfigBar(uint16_t offset);
+    template <typename T> void WriteConfigBar(uint16_t offset, T val);
     mx_status_t CopyDeviceConfig(void* _buf, size_t len);
 
     void Reset();
@@ -68,10 +68,10 @@ protected:
     // bar0 memory map or PIO
     uint32_t bar0_pio_base_ = 0;
     uint32_t bar0_size_ = 0; // for now, must be set in subclass before Bind()
-    volatile void* bar0_mmio_base_ = nullptr;
+    volatile uint8_t* bar0_mmio_base_ = nullptr;
     mx::handle bar0_mmio_handle_;
 
-    // for non-transitional devices, bar4 holds the main config and control registres
+    // for non-transitional devices, bar4 holds the main config and control registers
     volatile void* bar4_mmio_base_ = nullptr;
     mx::handle bar4_mmio_handle_;
     struct {

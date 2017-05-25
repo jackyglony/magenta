@@ -18,7 +18,7 @@
 #include "trace.h"
 #include "utils.h"
 
-#define LOCAL_TRACE 0
+#define LOCAL_TRACE 1
 
 // clang-format off
 #define VIRTIO_BLK_F_BARRIER  (1<<0)
